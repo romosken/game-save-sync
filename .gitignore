@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.tools/
+dist/
+build/pyinstaller/
+*.egg-info/
+.pytest_cache/
+vendor/rclone.exe
+vendor/rclone

@@ -1,0 +1,25 @@
+[project]
+name = "gamesavesync"
+version = "0.1.0"
+description = "Sync emulator and offline game saves through cloud storage"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["psutil>=5.9"]
+
+[project.optional-dependencies]
+windows = ["pywin32>=306"]
+dev = ["pytest>=8"]
+build = ["pyinstaller>=6"]
+
+[project.scripts]
+gamesavesync = "gamesavesync.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
