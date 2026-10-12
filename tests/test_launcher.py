@@ -47,9 +47,17 @@ def test_launch_environment_hides_the_sync_tool_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(tool / "GameSaveSync.exe"), raising=False)
     monkeypatch.setattr(sys, "_MEIPASS", str(internal), raising=False)
-    monkeypatch.setenv("PATH", os.pathsep.join([str(internal), str(tool), str(keep)]))
+    nested = internal / "bin"
+    nested.mkdir()
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join([str(internal), str(nested), str(tool) + os.sep, str(keep)]),
+    )
     parts = launch_environment()["PATH"].split(os.pathsep)
-    assert parts == [str(keep)]
+    assert str(keep) in parts
+    assert str(internal) not in parts
+    assert str(nested) not in parts
+    assert not any("GameSaveSync" in part for part in parts)
 
 
 def test_lock_blocks_a_second_sync_and_clears_a_dead_pid(tmp_path):

@@ -39,36 +39,159 @@ def split_args(args: str) -> list[str]:
     return shlex.split(args, posix=(os.name != "nt"))
 
 
+def _sync_tool_roots() -> list[str]:
+    """Folders that contain this tool's private DLLs."""
+    roots: list[str] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(meipass)
+    if getattr(sys, "frozen", False):
+        app_dir = os.path.dirname(os.path.abspath(sys.executable))
+        roots.append(app_dir)
+        roots.append(os.path.join(app_dir, "_internal"))
+    return roots
+
+
+def _inside_sync_tool(path: str, roots: list[str]) -> bool:
+    try:
+        normal = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    except (OSError, ValueError):
+        return False
+    for root in roots:
+        try:
+            root_normal = os.path.normcase(os.path.normpath(os.path.abspath(root)))
+        except (OSError, ValueError):
+            continue
+        if normal == root_normal or normal.startswith(root_normal + os.sep):
+            return True
+    return False
+
+
 def launch_environment() -> dict[str, str]:
     """Environment for the game, without this tool's bundled DLLs on PATH.
 
-    A packaged build keeps VCRUNTIME140.dll next to GameSaveSync.exe. If the
-    game inherits that folder on PATH, Windows loads the wrong copy and
-    emulators such as RPCS3 refuse to start.
+    A packaged build keeps VCRUNTIME140.dll in its ``_internal`` folder. If the
+    game inherits that folder, Windows loads the wrong copy and emulators such
+    as RPCS3 refuse to start.
     """
     env = os.environ.copy()
-    blocked: set[str] = set()
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        blocked.add(os.path.normcase(os.path.abspath(meipass)))
-    if getattr(sys, "frozen", False):
-        app_dir = os.path.dirname(os.path.abspath(sys.executable))
-        blocked.add(os.path.normcase(app_dir))
-        blocked.add(os.path.normcase(os.path.join(app_dir, "_internal")))
-    kept: list[str] = []
-    for part in env.get("PATH", "").split(os.pathsep):
-        if not part:
-            continue
-        try:
-            normal = os.path.normcase(os.path.abspath(part))
-        except (OSError, ValueError):
-            kept.append(part)
-            continue
-        if normal not in blocked:
-            kept.append(part)
+    roots = _sync_tool_roots()
+    kept = [
+        part
+        for part in env.get("PATH", "").split(os.pathsep)
+        if part and not _inside_sync_tool(part, roots)
+    ]
+    if os.name == "nt":
+        system_root = env.get("SystemRoot") or env.get("SYSTEMROOT") or r"C:\Windows"
+        system_dirs = [
+            os.path.join(system_root, "System32"),
+            system_root,
+            os.path.join(system_root, "System32", "Wbem"),
+        ]
+        merged: list[str] = []
+        seen: set[str] = set()
+        for part in system_dirs + kept:
+            key = os.path.normcase(os.path.normpath(part))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(part)
+        kept = merged
     env["PATH"] = os.pathsep.join(kept)
     env.pop("_MEIPASS2", None)
     return env
+
+
+def _apply_launch_environment() -> dict[str, str | None]:
+    """Point DLL lookup at Windows while the game starts, then restore it."""
+    previous_path = os.environ.get("PATH")
+    cleaned = launch_environment()
+    os.environ["PATH"] = cleaned["PATH"]
+    previous_dll: str | None = None
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = kernel32.GetDllDirectoryW(32768, buffer)
+        previous_dll = buffer.value if length else None
+        kernel32.SetDllDirectoryW(None)
+    return {"PATH": previous_path, "dll": previous_dll}
+
+
+def _restore_launch_environment(saved: dict[str, str | None]) -> None:
+    previous_path = saved.get("PATH")
+    if previous_path is None:
+        os.environ.pop("PATH", None)
+    else:
+        os.environ["PATH"] = previous_path
+    if os.name != "nt":
+        return
+    import ctypes
+
+    ctypes.WinDLL("kernel32", use_last_error=True).SetDllDirectoryW(saved.get("dll"))
+
+
+def _shell_execute_and_wait(exe: Path, args: list[str]) -> int:
+    """Open the program from its own folder, the way Explorer does."""
+    import ctypes
+    from ctypes import wintypes
+
+    resolved = exe.resolve()
+    game_dir = str(resolved.parent)
+    parameters = subprocess.list2cmdline(args) if args else None
+
+    class ShellExecuteInfo(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("fMask", ctypes.c_ulong),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", wintypes.HKEY),
+            ("dwHotKey", wintypes.DWORD),
+            ("hIconOrMonitor", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    see_mask_nocloseprocess = 0x00000040
+    sw_shownormal = 1
+    infinite = 0xFFFFFFFF
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell_execute = shell32.ShellExecuteExW
+    shell_execute.argtypes = [ctypes.POINTER(ShellExecuteInfo)]
+    shell_execute.restype = wintypes.BOOL
+
+    info = ShellExecuteInfo()
+    info.cbSize = ctypes.sizeof(ShellExecuteInfo)
+    info.fMask = see_mask_nocloseprocess
+    info.lpVerb = "open"
+    info.lpFile = str(resolved)
+    info.lpParameters = parameters
+    info.lpDirectory = game_dir
+    info.nShow = sw_shownormal
+    saved = _apply_launch_environment()
+    try:
+        started = bool(shell_execute(ctypes.byref(info)))
+        error = ctypes.get_last_error()
+    finally:
+        _restore_launch_environment(saved)
+    if not started:
+        raise LaunchError(f"Could not start {resolved} (Windows error {error})")
+    if not info.hProcess:
+        raise LaunchError(f"Started {resolved} but could not wait for it to close")
+    kernel32.WaitForSingleObject(info.hProcess, infinite)
+    code = wintypes.DWORD()
+    kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+    kernel32.CloseHandle(info.hProcess)
+    return int(code.value)
 
 
 def wait_for_app(
@@ -96,14 +219,27 @@ def wait_for_app(
             return None
         return list_processes()
 
+    game_dir = str(exe.resolve().parent)
+    arguments = split_args(profile.args)
+    # On Windows, open the program from its own folder after the sync. A direct
+    # child of this tool still searches the sync tool's DLL folder and emulators
+    # then refuse VCRUNTIME140.dll.
+    if os.name == "nt" and not profile.wait_process:
+        return _shell_execute_and_wait(exe, arguments)
+
     before: set[int] = set()
     if profile.wait_process:
         before = matching_pids(profile.wait_process, processes())
-    proc = popen(
-        [str(exe), *split_args(profile.args)],
-        cwd=str(exe.resolve().parent),
-        env=launch_environment(),
-    )
+    saved = _apply_launch_environment() if os.name == "nt" else None
+    try:
+        proc = popen(
+            [str(exe), *arguments],
+            cwd=game_dir,
+            env=launch_environment(),
+        )
+    finally:
+        if saved is not None:
+            _restore_launch_environment(saved)
     if not profile.wait_process:
         return proc.wait()
     deadline = time.monotonic() + appear_timeout
